@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from awesomeversion import AwesomeVersion
 from mashumaro import DataClassDictMixin
@@ -19,6 +19,7 @@ from music_assistant_models.auth import Scope
 from music_assistant_models.enums import EventType
 
 from music_assistant.constants import CONF_CORE
+from music_assistant.controllers.webserver.remote_access.ice_servers import get_env_ice_servers
 from music_assistant.helpers.webrtc_certificate import (
     get_or_create_remote_id,
     get_or_create_webrtc_certificate_pems,
@@ -98,11 +99,11 @@ class RemoteAccessManager:
         async with self._gateway_lock:
             await self._stop_gateway_locked()
 
-    async def get_ice_servers(self) -> list[dict[str, str]]:
+    async def get_ice_servers(self) -> list[dict[str, Any]]:
         """
         Get ICE servers for WebRTC connections.
 
-        Returns HA Cloud TURN servers if available, otherwise returns public STUN servers.
+        An explicit MA_ICE_SERVERS override takes precedence over HA Cloud and public STUN.
         This method can be called regardless of whether remote access is enabled.
 
         :return: List of ICE server configurations.
@@ -113,6 +114,9 @@ class RemoteAccessManager:
             {"urls": "stun:stun.cloudflare.com:3478"},
             {"urls": "stun:stun.home-assistant.io:3478"},
         ]
+
+        if (env_servers := get_env_ice_servers()) is not None:
+            return env_servers
 
         # Try to get HA Cloud ICE servers
         _, ice_servers = await self._get_ha_cloud_status()
@@ -225,7 +229,9 @@ class RemoteAccessManager:
             ice_servers=ice_servers,
             # Pass callback to get fresh ICE servers for each client connection
             # This ensures TURN credentials are always valid
-            ice_servers_callback=self.get_ice_servers if ha_cloud_available else None,
+            ice_servers_callback=self.get_ice_servers
+            if ha_cloud_available or get_env_ice_servers() is not None
+            else None,
             # Pass callback to set sendspin player on websocket client
             set_sendspin_player_callback=self.webserver.set_sendspin_player_for_webrtc_session,
         )

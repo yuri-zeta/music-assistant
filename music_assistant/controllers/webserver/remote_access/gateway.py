@@ -34,6 +34,7 @@ from aiolibdatachannel import (
 
 from music_assistant.constants import MASS_LOGGER_NAME, SENDSPIN_SERVER_PORT, VERBOSE_LOG_LEVEL
 from music_assistant.controllers.streams.live_announcements import LIVE_ANNOUNCEMENT_ROUTE
+from music_assistant.controllers.webserver.remote_access.ice_servers import get_env_ice_servers
 
 if TYPE_CHECKING:
     from aiolibdatachannel import DataChannel
@@ -188,7 +189,12 @@ class WebRTCGateway:
         }
 
         # Static ICE servers used at registration time (relayed to clients via signaling server)
-        self.ice_servers = ice_servers or self.DEFAULT_ICE_SERVERS
+        env_ice_servers = get_env_ice_servers()
+        self.ice_servers = (
+            env_ice_servers
+            if env_ice_servers is not None
+            else ice_servers or self.DEFAULT_ICE_SERVERS
+        )
 
         self.sessions: dict[str, WebRTCSession] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
@@ -267,6 +273,8 @@ class WebRTCGateway:
 
     async def _get_fresh_ice_servers(self) -> list[dict[str, Any]]:
         """Get fresh ICE servers for a new WebRTC session."""
+        if (env_servers := get_env_ice_servers()) is not None:
+            return env_servers
         if self._ice_servers_callback:
             try:
                 fresh_servers = await self._ice_servers_callback()
@@ -403,11 +411,12 @@ class WebRTCGateway:
     async def _register(self) -> None:
         """Register with the signaling server."""
         if self._signaling_ws:
+            ice_servers = get_env_ice_servers()
             await self._signaling_ws.send_json(
                 {
                     "type": "register-server",
                     "remoteId": self._remote_id,
-                    "iceServers": self.ice_servers,
+                    "iceServers": ice_servers if ice_servers is not None else self.ice_servers,
                 }
             )
 

@@ -3,8 +3,11 @@
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import logging
+import re
+import time
 from collections.abc import AsyncIterator, Callable, Coroutine
 from types import SimpleNamespace
 from typing import Any, cast
@@ -37,6 +40,7 @@ from music_assistant.controllers.webserver.remote_access.gateway import (
     WebRTCSession,
     _is_usable_ice_url,
 )
+from music_assistant.controllers.webserver.remote_access.ice_servers import get_env_ice_servers
 from music_assistant.helpers.webrtc_certificate import (
     _generate_certificate,
     _remote_id_from_certificate,
@@ -86,6 +90,144 @@ def _create_remote_access_manager() -> RemoteAccessManager:
     manager = RemoteAccessManager(webserver)
     manager._enabled = True
     return manager
+
+
+@pytest.mark.parametrize("env_value", [None, ""])
+async def test_ice_servers_unset_preserves_defaults(
+    monkeypatch: pytest.MonkeyPatch, env_value: str | None
+) -> None:
+    """With no override, both remote access defaults remain unchanged."""
+    if env_value is None:
+        monkeypatch.delenv("MA_ICE_SERVERS", raising=False)
+    else:
+        monkeypatch.setenv("MA_ICE_SERVERS", env_value)
+    manager = _create_remote_access_manager()
+    manager._get_ha_cloud_status = AsyncMock(return_value=(False, None))  # type: ignore[method-assign]
+
+    assert get_env_ice_servers() is None
+    assert await manager.get_ice_servers() == [
+        {"urls": "stun:stun.l.google.com:19302"},
+        {"urls": "stun:stun.cloudflare.com:3478"},
+        {"urls": "stun:stun.home-assistant.io:3478"},
+    ]
+    gateway = WebRTCGateway(http_session=Mock(), remote_id="id", cert_pem="", key_pem="")
+    assert gateway.ice_servers == [
+        {"urls": "stun:stun.home-assistant.io:3478"},
+        {"urls": "stun:stun.l.google.com:19302"},
+        {"urls": "stun:stun1.l.google.com:19302"},
+        {"urls": "stun:stun.cloudflare.com:3478"},
+    ]
+
+
+async def test_ice_servers_override_precedes_ha_cloud(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit override wins over HA Cloud servers in both paths."""
+    configured = [{"urls": ["stun:example.com:3478", "turn:example.com:3478"]}]
+    monkeypatch.setenv("MA_ICE_SERVERS", json.dumps(configured))
+    manager = _create_remote_access_manager()
+    manager._get_ha_cloud_status = AsyncMock(  # type: ignore[method-assign]
+        return_value=(True, [{"urls": "turn:cloud.example.com:3478"}])
+    )
+
+    assert get_env_ice_servers() == configured
+    assert await manager.get_ice_servers() == configured
+    gateway = WebRTCGateway(
+        http_session=Mock(),
+        remote_id="id",
+        cert_pem="",
+        key_pem="",
+        ice_servers=[{"urls": "turn:cloud.example.com:3478"}],
+    )
+    assert gateway.ice_servers == configured
+    assert await gateway._get_fresh_ice_servers() == configured
+
+
+async def test_ice_servers_malformed_json_falls_back(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Bad JSON logs a warning and leaves the default paths usable."""
+    monkeypatch.setenv("MA_ICE_SERVERS", "[not-json")
+    manager = _create_remote_access_manager()
+    manager._get_ha_cloud_status = AsyncMock(return_value=(False, None))  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.WARNING):
+        assert get_env_ice_servers() is None
+        assert await manager.get_ice_servers() == [
+            {"urls": "stun:stun.l.google.com:19302"},
+            {"urls": "stun:stun.cloudflare.com:3478"},
+            {"urls": "stun:stun.home-assistant.io:3478"},
+        ]
+        gateway = WebRTCGateway(http_session=Mock(), remote_id="id", cert_pem="", key_pem="")
+    assert gateway.ice_servers == WebRTCGateway.DEFAULT_ICE_SERVERS
+    assert "Invalid MA_ICE_SERVERS JSON" in caplog.text
+
+
+async def test_ice_servers_shared_secret_is_minted_per_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TURN REST credentials use the configured TTL and refresh on each lookup."""
+    secret = "test-secret-do-not-use"
+    monkeypatch.setenv(
+        "MA_ICE_SERVERS", json.dumps([{"urls": "turn:example.com:3478", "secret": secret}])
+    )
+    gateway = WebRTCGateway(http_session=Mock(), remote_id="id", cert_pem="", key_pem="")
+
+    first = (await gateway._get_fresh_ice_servers())[0]
+    assert re.fullmatch(r"\d+:ma", first["username"])
+    assert int(first["username"].split(":")[0]) - int(time.time()) in range(3598, 3601)
+    assert (
+        first["credential"]
+        == base64.b64encode(
+            hmac.new(secret.encode(), first["username"].encode(), hashlib.sha1).digest()
+        ).decode()
+    )
+    assert "secret" not in first
+
+    with patch(
+        "music_assistant.controllers.webserver.remote_access.ice_servers.time.time",
+        return_value=time.time() + 30,
+    ):
+        second = (await gateway._get_fresh_ice_servers())[0]
+    assert int(second["username"].split(":")[0]) > int(first["username"].split(":")[0])
+
+
+def test_ice_servers_static_credentials_pass_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Static credentials remain exactly as configured."""
+    configured = [
+        {
+            "urls": "turn:example.com:3478",
+            "username": "static-user",
+            "credential": "static-password",
+        }
+    ]
+    monkeypatch.setenv("MA_ICE_SERVERS", json.dumps(configured))
+
+    assert get_env_ice_servers() == configured
+
+
+async def test_ice_servers_registration_refreshes_secret_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Signaling registration gets credentials minted at send time."""
+    monkeypatch.setenv(
+        "MA_ICE_SERVERS",
+        json.dumps(
+            [{"urls": "turn:example.com:3478", "secret": "test-secret-do-not-use", "ttl": 120}]
+        ),
+    )
+    gateway = WebRTCGateway(http_session=Mock(), remote_id="id", cert_pem="", key_pem="")
+    signaling = Mock()
+    signaling.send_json = AsyncMock()
+    gateway._signaling_ws = signaling
+
+    with patch(
+        "music_assistant.controllers.webserver.remote_access.ice_servers.time.time",
+        return_value=1000,
+    ):
+        await gateway._register()
+    sent = signaling.send_json.await_args.args[0]["iceServers"][0]
+    assert sent["username"] == "1120:ma"
+    assert sent["username"] != gateway.ice_servers[0]["username"]
+    assert "secret" not in sent
 
 
 def test_remote_access_debounces_restart_without_dropping_gateway() -> None:
