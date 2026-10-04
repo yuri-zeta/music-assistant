@@ -300,7 +300,9 @@ async def test_linker_skips_albums_of_a_unique_only_provider() -> None:
     album = _library_album("1")
     loaded = {"spotify": ["spotify_1"], "apple_music": ["apple_music_1"]}
     with _harness(album, loaded=loaded) as harness:
-        harness.ctrl.mass.get_provider.return_value.library_sync_unique_only.return_value = True
+        get_provider = harness.ctrl.mass.get_provider
+        assert isinstance(get_provider, Mock)
+        get_provider.return_value.library_sync_unique_only.return_value = True
         added = await harness.ctrl.link_musicbrainz_mappings(album, [APPLE_ALBUM_URL])
 
     assert added == []
